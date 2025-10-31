@@ -1,0 +1,255 @@
+import numpy
+import scipy
+print(numpy.__version__, scipy.__version__)
+# alphamarket_bugfixer.py
+import numpy as np
+from scipy.stats import norm
+from datetime import datetime, timedelta
+import math
+
+# Constants for Black-Scholes Model
+R = 0.05  # Risk-free rate (5%)
+TOLERANCE = 1e-5
+MAX_ITERATIONS = 15
+IV_MIN = 0.05  # 5%
+IV_MAX = 1.50  # 150%
+PARITY_EPSILON = 0.50  # Max tolerable parity error (0.50 currency units)
+SYNC_MAX_DELTA_MS = 100  # Max allowed desynchronization in milliseconds
+
+
+# -------------------------------------------------------
+#                FinancialModels Class
+# -------------------------------------------------------
+class FinancialModels:
+    """Implements Black-Scholes and numerical methods."""
+
+    @staticmethod
+    def _d1(S, K, T, R, sigma):
+        if T <= 0 or sigma <= 0:
+            return 0
+        return (np.log(S / K) + (R + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+
+    @staticmethod
+    def _d2(S, K, T, R, sigma):
+        return FinancialModels._d1(S, K, T, R, sigma) - sigma * np.sqrt(T)
+
+    @staticmethod
+    def black_scholes(S, K, T, R, sigma, option_type='CALL'):
+        """Calculates theoretical option price."""
+        if T <= 0 or sigma <= 0:
+            return max(0, S - K) if option_type == 'CALL' else max(0, K - S)
+
+        d1 = FinancialModels._d1(S, K, T, R, sigma)
+        d2 = FinancialModels._d2(S, K, T, R, sigma)
+
+        if option_type == 'CALL':
+            return S * norm.cdf(d1) - K * np.exp(-R * T) * norm.cdf(d2)
+        elif option_type == 'PUT':
+            return K * np.exp(-R * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+        else:
+            raise ValueError("Option type must be 'CALL' or 'PUT'")
+
+    @staticmethod
+    def calculate_vega(S, K, T, R, sigma):
+        if T <= 0 or sigma <= 0:
+            return 0
+        d1 = FinancialModels._d1(S, K, T, R, sigma)
+        return S * norm.pdf(d1) * np.sqrt(T)
+
+    @staticmethod
+    def implied_volatility(market_price, S, K, T, R, option_type='CALL', initial_guess=0.25):
+        if market_price <= 0:
+            return -1
+
+        sigma_guess = initial_guess
+
+        for _ in range(MAX_ITERATIONS):
+            price_calc = FinancialModels.black_scholes(S, K, T, R, sigma_guess, option_type)
+            vega = FinancialModels.calculate_vega(S, K, T, R, sigma_guess)
+            error = market_price - price_calc
+
+            if abs(error) < TOLERANCE:
+                if IV_MIN < sigma_guess < IV_MAX:
+                    return sigma_guess
+                return -1
+
+            if abs(vega) < 1e-8:
+                break
+
+            sigma_guess -= error / vega
+
+            if sigma_guess <= 0:
+                sigma_guess = sigma_guess * 0.5 + 0.1
+
+        return -1
+
+
+# -------------------------------------------------------
+#                ValidationEngine Class
+# -------------------------------------------------------
+class ValidationEngine:
+    """Performs real-time data integrity checks on incoming market ticks."""
+
+    @staticmethod
+    def check_synchronization(tick):
+        try:
+            ts_c = tick['timestamp']
+            ts_p = tick['put_timestamp']
+
+            # Handle both datetime and numeric timestamps
+            if isinstance(ts_c, datetime) and isinstance(ts_p, datetime):
+                dt_c_p = abs((ts_c - ts_p).total_seconds() * 1000)
+            else:
+                dt_c_p = abs(float(ts_c) - float(ts_p))
+
+            if dt_c_p > SYNC_MAX_DELTA_MS:
+                tick['bug_flag'] = 'STALE'
+                tick['error_detail'] = f"C/P sync delta: {dt_c_p:.2f}ms"
+                return True
+            return False
+        except Exception as e:
+            tick['bug_flag'] = 'ERROR'
+            tick['error_detail'] = str(e)
+            return True
+
+    @staticmethod
+    def check_parity(tick):
+        S, K, T = tick['underlying_price'], tick['strike'], tick['time_T']
+        C, P = tick['call_C'], tick['put_P']
+        R_local = tick.get('risk_free_R', R)
+
+        TFD = S - K * np.exp(-R_local * T)
+        OD = C - P
+        parity_error = abs(OD - TFD)
+        tick['parity_error'] = parity_error
+
+        if parity_error > PARITY_EPSILON:
+            tick['bug_flag'] = 'PARITY'
+            tick['error_detail'] = f"Parity Error: {parity_error:.3f}"
+            return True
+        return False
+
+    @staticmethod
+    def check_implied_volatility(tick):
+        S, K, T = tick['underlying_price'], tick['strike'], tick['time_T']
+        C, P = tick['call_C'], tick['put_P']
+        R_local = tick.get('risk_free_R', R)
+        initial_guess = tick.get('historical_IV', 0.25)
+
+        iv_c = FinancialModels.implied_volatility(C, S, K, T, R_local, 'CALL', initial_guess)
+        iv_p = FinancialModels.implied_volatility(P, S, K, T, R_local, 'PUT', initial_guess)
+
+        if iv_c < 0 or iv_p < 0:
+            tick['bug_flag'] = 'IV_UNSTABLE'
+            tick['error_detail'] = f"IV failure: C={iv_c:.3f}, P={iv_p:.3f}"
+            tick['iv_c'] = iv_c
+            tick['iv_p'] = iv_p
+            return True
+
+        tick['iv_c'] = iv_c
+        tick['iv_p'] = iv_p
+        return False
+
+
+# -------------------------------------------------------
+#                BugFixer Class
+# -------------------------------------------------------
+class BugFixer:
+    """Applies autonomous remediation logic to flagged ticks."""
+
+    @staticmethod
+    def fix_tick(tick, last_validated_iv=0.20):
+        bug_flag = tick.get('bug_flag')
+
+        if bug_flag == 'STALE':
+            S, K, T = tick['underlying_price'], tick['strike'], tick['time_T']
+            R_local = tick.get('risk_free_R', R)
+
+            tick['call_C'] = FinancialModels.black_scholes(S, K, T, R_local, last_validated_iv, 'CALL')
+            tick['put_P'] = FinancialModels.black_scholes(S, K, T, R_local, last_validated_iv, 'PUT')
+
+            tick['fix_applied'] = 'STALE_RECALC'
+            tick['iv_used_for_fix'] = last_validated_iv
+
+        elif bug_flag == 'PARITY':
+            S, K, T = tick['underlying_price'], tick['strike'], tick['time_T']
+            R_local = tick.get('risk_free_R', R)
+            TFD = S - K * np.exp(-R_local * T)
+            OD = tick['call_C'] - tick['put_P']
+
+            adjustment = (OD - TFD) / 2.0
+            tick['call_C'] -= adjustment
+            tick['put_P'] += adjustment
+            tick['fix_applied'] = 'PARITY_SYMMETRIC_ADJ'
+
+        elif bug_flag == 'IV_UNSTABLE':
+            S, K, T = tick['underlying_price'], tick['strike'], tick['time_T']
+            R_local = tick.get('risk_free_R', R)
+            tick['call_C'] = FinancialModels.black_scholes(S, K, T, R_local, last_validated_iv, 'CALL')
+            tick['put_P'] = FinancialModels.black_scholes(S, K, T, R_local, last_validated_iv, 'PUT')
+            tick['iv_c'] = tick['iv_p'] = last_validated_iv
+            tick['fix_applied'] = 'IV_SUBSTITUTION'
+
+        elif bug_flag == 'ERROR':
+            tick['fix_applied'] = 'REJECTED'
+            tick['status'] = 'REJECTED'
+            return
+
+        if bug_flag in ['STALE', 'PARITY', 'IV_UNSTABLE']:
+            tick['status'] = 'CORRECTED'
+            tick.pop('bug_flag', None)
+        else:
+            tick['status'] = 'VALID'
+
+
+# -------------------------------------------------------
+#                Utility Function
+# -------------------------------------------------------
+def format_tick(tick):
+    return {
+        'Asset': tick.get('asset_id'),
+        'S': tick.get('underlying_price'),
+        'K': tick.get('strike'),
+        'C_New': tick.get('call_C'),
+        'P_New': tick.get('put_P'),
+        'Parity_Err': f"{tick.get('parity_error', 0):.4f}",
+        'Status': tick.get('status', 'VALID'),
+        'Correction': tick.get('fix_applied', 'N/A')
+    }
+
+
+# -------------------------------------------------------
+#                Demo / Test Section
+# -------------------------------------------------------
+def main():
+    # Create sample tick data (simulate a stale timestamp + parity bug)
+    tick = {
+        'asset_id': 'AAPL',
+        'timestamp': datetime.now(),
+        'put_timestamp': datetime.now() - timedelta(milliseconds=200),  # Desync > 100ms
+        'underlying_price': 150,
+        'strike': 155,
+        'time_T': 0.25,
+        'call_C': 5.5,
+        'put_P': 7.0,
+        'risk_free_R': 0.05,
+    }
+
+    print("🔍 Validating Tick...")
+    ValidationEngine.check_synchronization(tick)
+    if 'bug_flag' not in tick:
+        ValidationEngine.check_parity(tick)
+    if 'bug_flag' not in tick:
+        ValidationEngine.check_implied_volatility(tick)
+
+    if 'bug_flag' in tick:
+        print(f"⚠️ Bug Detected: {tick['bug_flag']} — {tick.get('error_detail')}")
+        BugFixer.fix_tick(tick)
+        print(f"✅ Fix Applied: {tick.get('fix_applied')}")
+
+    print("\n📊 Final Tick Snapshot:")
+    print(format_tick(tick))
+
+
+if __name__ == "__main__":
+    main()
